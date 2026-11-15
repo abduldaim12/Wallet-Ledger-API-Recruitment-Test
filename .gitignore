@@ -1,0 +1,8 @@
+bin/
+*.exe
+*.log
+.DS_Store
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.pdf

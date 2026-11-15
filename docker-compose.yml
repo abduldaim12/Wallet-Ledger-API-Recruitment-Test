@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: wallet
+      POSTGRES_USER: wallet
+      POSTGRES_PASSWORD: walletpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      API_TOKEN: recruitment-test-token
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: wallet
+      DB_PASSWORD: walletpass
+      DB_NAME: wallet
+      SEED_ROWS: 10000000
+      SEED_USERS: 100000
+      LISTEN_ADDR: :8080
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
