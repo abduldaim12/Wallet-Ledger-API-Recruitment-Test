@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+from psycopg_pool import ConnectionPool
 from psycopg.rows import tuple_row
 
 
@@ -21,6 +22,16 @@ def get_db_dsn() -> str:
 def connect_db() -> psycopg.Connection:
     conn = psycopg.connect(get_db_dsn(), autocommit=False, row_factory=tuple_row)
     return conn
+
+
+def create_connection_pool() -> ConnectionPool:
+    return ConnectionPool(
+        conninfo=get_db_dsn(),
+        min_size=int(os.getenv("DB_POOL_MIN_SIZE", "5")),
+        max_size=int(os.getenv("DB_POOL_MAX_SIZE", "40")),
+        kwargs={"autocommit": False, "row_factory": tuple_row},
+        open=False,
+    )
 
 
 def ensure_schema(conn: psycopg.Connection) -> None:

@@ -107,7 +107,9 @@ Each credit and debit performs a `SELECT ... FOR UPDATE` on the target user row 
 
 The debit path checks `balance >= amount` before writing to the ledger, so concurrent debits cannot produce a negative balance or a lost update. The credit path uses the same transaction to both insert the ledger row and update the cache.
 
-Retry logic around serialization and deadlock SQL states is also included so transient Postgres concurrency failures are retried instead of surfacing as 500s.
+The API uses synchronous FastAPI route handlers for synchronous Psycopg operations, so database work runs in FastAPI's worker thread pool rather than blocking the event loop. A managed Psycopg connection pool is opened and closed with the application lifespan; its defaults are 5 minimum and 40 maximum connections, configurable with `DB_POOL_MIN_SIZE` and `DB_POOL_MAX_SIZE`.
+
+Retry logic around serialization, deadlock, and lock-not-available SQL states uses a bounded exponential backoff before retrying the complete transaction.
 
 ### Seed strategy
 

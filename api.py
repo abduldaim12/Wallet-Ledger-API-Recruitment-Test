@@ -1,5 +1,7 @@
 import hmac
 import os
+import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 import psycopg
@@ -9,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from typing_extensions import Annotated
 
-from database import connect_db
+from database import create_connection_pool
 
 
 class LedgerError(Exception):
@@ -57,7 +59,18 @@ def require_auth(request: Request) -> None:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI()
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        pool = create_connection_pool()
+        pool.open()
+        try:
+            pool.wait()
+            app.state.db_pool = pool
+            yield
+        finally:
+            pool.close()
+
+    app = FastAPI(lifespan=lifespan)
 
     @app.exception_handler(LedgerError)
     async def ledger_error_handler(_request: Request, exc: LedgerError) -> JSONResponse:
@@ -77,17 +90,11 @@ def create_app() -> FastAPI:
         return await call_next(request)
 
     @app.post("/credit")
-    async def credit(payload: BalanceRequest, request: Request) -> dict[str, Any]:
-        try:
-            require_auth(request)
-        except LedgerError as exc:
-            raise exc
-
-        conn = connect_db()
-        try:
+    def credit(payload: BalanceRequest, request: Request) -> dict[str, Any]:
+        with request.app.state.db_pool.connection() as conn:
             for attempt in range(5):
                 try:
-                    with conn:
+                    with conn.transaction():
                         with conn.cursor() as cur:
                             cur.execute(
                                 "INSERT INTO user_balances (user_id, balance) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING",
@@ -109,31 +116,18 @@ def create_app() -> FastAPI:
                             )
                     return {"user_id": payload.user_id, "balance": next_balance}
                 except psycopg.Error as exc:
-                    conn.rollback()
                     if not _is_retryable_db_error(exc) or attempt == 4:
                         raise
-        except LedgerError:
-            raise
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+                    time.sleep(min(0.01 * (2**attempt), 0.1))
 
         raise RuntimeError("credit transaction failed after retries")
 
     @app.post("/debit")
-    async def debit(payload: BalanceRequest, request: Request) -> dict[str, Any]:
-        try:
-            require_auth(request)
-        except LedgerError as exc:
-            raise exc
-
-        conn = connect_db()
-        try:
+    def debit(payload: BalanceRequest, request: Request) -> dict[str, Any]:
+        with request.app.state.db_pool.connection() as conn:
             for attempt in range(5):
                 try:
-                    with conn:
+                    with conn.transaction():
                         with conn.cursor() as cur:
                             cur.execute(
                                 "SELECT balance FROM user_balances WHERE user_id = %s FOR UPDATE",
@@ -156,39 +150,24 @@ def create_app() -> FastAPI:
                             )
                     return {"user_id": payload.user_id, "balance": next_balance}
                 except psycopg.Error as exc:
-                    conn.rollback()
                     if not _is_retryable_db_error(exc) or attempt == 4:
                         raise
+                    time.sleep(min(0.01 * (2**attempt), 0.1))
                 except LedgerError:
                     raise
-        except LedgerError:
-            raise
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
         raise RuntimeError("debit transaction failed after retries")
 
     @app.get("/balance/{user_id}")
-    async def get_balance(user_id: Annotated[str, StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")], request: Request) -> dict[str, Any]:
-        try:
-            require_auth(request)
-        except LedgerError as exc:
-            raise exc
-
-        conn = connect_db()
-        try:
-            with conn:
+    def get_balance(user_id: Annotated[str, StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")], request: Request) -> dict[str, Any]:
+        with request.app.state.db_pool.connection() as conn:
+            with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute("SELECT balance FROM user_balances WHERE user_id = %s", (user_id,))
                     row = cur.fetchone()
                     if row is None:
                         raise LedgerError(404, "user_not_found", "user does not exist")
                     return {"user_id": user_id, "balance": row[0]}
-        finally:
-            conn.close()
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
