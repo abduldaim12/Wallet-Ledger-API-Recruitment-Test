@@ -27,3 +27,9 @@ def test_valid_bearer_token_is_accepted():
     request = SimpleNamespace(headers={"authorization": "Bearer recruitment-test-token"})
     os.environ["API_TOKEN"] = "recruitment-test-token"
     require_auth(request)
+
+
+def test_valid_bearer_token_with_extra_whitespace_is_accepted():
+    request = SimpleNamespace(headers={"authorization": "  bearer\t\trecruitment-test-token  "})
+    os.environ["API_TOKEN"] = "recruitment-test-token"
+    require_auth(request)

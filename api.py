@@ -29,10 +29,15 @@ def require_auth(request: Request) -> None:
     if not auth_header:
         raise LedgerError(401, "unauthorized", "missing Authorization header")
 
-    scheme, _, token = auth_header.partition(" ")
-    if scheme.lower() != "bearer" or not token:
+    parts = auth_header.strip().split(None, 1)
+    if len(parts) != 2:
         raise LedgerError(401, "unauthorized", "invalid Authorization scheme")
 
+    scheme, token = parts
+    if scheme.lower() != "bearer" or not token.strip():
+        raise LedgerError(401, "unauthorized", "invalid Authorization scheme")
+
+    token = token.strip()
     expected = os.getenv("API_TOKEN", "")
     if not hmac.compare_digest(token, expected):
         raise LedgerError(401, "unauthorized", "invalid bearer token")
