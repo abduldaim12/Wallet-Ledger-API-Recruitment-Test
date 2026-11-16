@@ -393,6 +393,19 @@ However, tail latency is high. These measurements represent a single-hot-user st
 
 Further performance evaluation should include distributed users, different concurrency levels, and separate 1M versus 10M database comparisons.
 
+### Repeat Run (2026-11-16)
+
+The threaded load-test client was used against `http://127.0.0.1:8080` with the same 100-worker, 1,000-requests-per-endpoint hot-user workload.
+
+| Metric | Credit | Debit | Balance |
+|---|---:|---:|---:|
+| Requests | 1,000 | 1,000 | 1,000 |
+| p50 | 806.369 ms | 571.120 ms | 481.505 ms |
+| p99 | 4,213.180 ms | 3,609.089 ms | 1,076.296 ms |
+| Successful responses | 1,000 | 1,000 | 1,000 |
+
+Total duration was 24.819 seconds (120.88 requests/second overall). The final balance matched the expected 1,000 units. The database row count and ledger-to-balance SQL reconciliation could not be independently verified for this repeat run in the current environment, so these numbers should not be treated as a verified 10M-row comparison.
+
 ## 9. Automated Tests
 
 The repository includes tests for:

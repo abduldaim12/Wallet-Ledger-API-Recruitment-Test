@@ -1,6 +1,4 @@
-
 import argparse
-import asyncio
 import json
 import math
 import os
@@ -8,6 +6,9 @@ import statistics
 import time
 import uuid
 from collections import Counter, defaultdict
+from queue import Queue
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
@@ -22,45 +23,45 @@ def percentile(values: list[float], percent: float) -> float:
     return ordered[index]
 
 
-async def worker(
-    queue: asyncio.Queue,
-    client: httpx.AsyncClient,
+def worker(
+    queue: Queue,
+    client: httpx.Client,
     latencies: dict,
     statuses: dict,
     errors: dict,
+    results_lock: Lock,
 ) -> None:
     while True:
-        job = await queue.get()
-
-        if job is None:
-            queue.task_done()
-            break
-
-        method, path, payload = job
-        started = time.perf_counter()
-
+        job = queue.get()
         try:
-            response = await client.request(
-                method,
-                f"{BASE_URL}{path}",
-                json=payload,
-            )
-            status = response.status_code
-            statuses[path][str(status)] += 1
+            if job is None:
+                return
 
-        except Exception as exc:
-            status = 0
-            statuses[path]["error"] += 1
-            if len(errors[path]) < 5:
-                errors[path].append(str(exc))
+            method, path, payload = job
+            started = time.perf_counter()
+            try:
+                response = client.request(
+                    method,
+                    f"{BASE_URL}{path}",
+                    json=payload,
+                )
+                status = str(response.status_code)
+                error = None
+            except Exception as exc:
+                status = "error"
+                error = str(exc)
 
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        latencies[path].append(elapsed_ms)
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            with results_lock:
+                statuses[path][status] += 1
+                latencies[path].append(elapsed_ms)
+                if error is not None and len(errors[path]) < 5:
+                    errors[path].append(error)
+        finally:
+            queue.task_done()
 
-        queue.task_done()
 
-
-async def main() -> None:
+def main() -> None:
     parser = argparse.ArgumentParser(description="Wallet Ledger API load test")
     parser.add_argument("--concurrency", type=int, default=100)
     parser.add_argument("--requests", type=int, default=1000)
@@ -78,26 +79,23 @@ async def main() -> None:
         parser.error("requests multiplied by amount must not exceed 1000000000")
 
     user_id = f"loadtest_{uuid.uuid4().hex}"
-
     latencies = defaultdict(list)
     statuses = defaultdict(Counter)
     errors = defaultdict(list)
+    results_lock = Lock()
+    jobs = Queue()
 
     limits = httpx.Limits(
         max_connections=args.concurrency,
         max_keepalive_connections=args.concurrency,
     )
 
-    timeout = httpx.Timeout(60.0)
-
-    async with httpx.AsyncClient(
+    with httpx.Client(
         headers={"Authorization": f"Bearer {TOKEN}"},
         limits=limits,
-        timeout=timeout,
+        timeout=httpx.Timeout(60.0),
     ) as client:
-
-        # Fund the test user so every debit can succeed.
-        setup = await client.post(
+        setup = client.post(
             f"{BASE_URL}/credit",
             json={"user_id": user_id, "amount": funding},
         )
@@ -108,48 +106,37 @@ async def main() -> None:
                 f"HTTP {setup.status_code}: {setup.text}"
             )
 
-        queue = asyncio.Queue()
-
-        # Interleave all three endpoints against one hot user.
         for _ in range(args.requests):
-            queue.put_nowait((
-                "POST",
-                "/credit",
-                {"user_id": user_id, "amount": args.amount},
-            ))
-            queue.put_nowait((
-                "POST",
-                "/debit",
-                {"user_id": user_id, "amount": args.amount},
-            ))
-            queue.put_nowait((
-                "GET",
-                f"/balance/{user_id}",
-                None,
-            ))
+            jobs.put(("POST", "/credit", {"user_id": user_id, "amount": args.amount}))
+            jobs.put(("POST", "/debit", {"user_id": user_id, "amount": args.amount}))
+            jobs.put(("GET", f"/balance/{user_id}", None))
 
-        tasks = [
-            asyncio.create_task(
-                worker(queue, client, latencies, statuses, errors)
-            )
-            for _ in range(args.concurrency)
-        ]
+        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            workers = [
+                executor.submit(
+                    worker,
+                    jobs,
+                    client,
+                    latencies,
+                    statuses,
+                    errors,
+                    results_lock,
+                )
+                for _ in range(args.concurrency)
+            ]
 
-        started = time.perf_counter()
+            started = time.perf_counter()
+            jobs.join()
+            duration = time.perf_counter() - started
 
-        await queue.join()
+            for _ in workers:
+                jobs.put(None)
+            jobs.join()
 
-        duration = time.perf_counter() - started
+            for future in workers:
+                future.result()
 
-        for _ in tasks:
-            queue.put_nowait(None)
-
-        await asyncio.gather(*tasks)
-
-        # Verify the final balance after all writes have completed.
-        final_response = await client.get(
-            f"{BASE_URL}/balance/{user_id}"
-        )
+        final_response = client.get(f"{BASE_URL}/balance/{user_id}")
 
     print("\n=== Wallet Ledger Load Test ===")
     print(f"User: {user_id}")
@@ -160,11 +147,9 @@ async def main() -> None:
     print(f"Overall throughput: {args.requests * 3 / duration:.2f} req/s")
 
     print("\n=== Endpoint Results ===")
-
     for path, samples in latencies.items():
         success = statuses[path].get("200", 0)
         total = len(samples)
-
         result = {
             "endpoint": path,
             "requests": total,
@@ -175,18 +160,15 @@ async def main() -> None:
             "throughput_rps": round(total / duration, 2),
             "http_statuses": dict(statuses[path]),
         }
-
         print(json.dumps(result))
 
         for error in errors[path]:
             print(f"Request error ({path}): {error}")
 
     print("\n=== Final Balance Verification ===")
-
     if final_response.status_code == 200:
         actual = final_response.json()["balance"]
         expected = funding
-
         print(f"Expected balance: {expected}")
         print(f"Actual balance:   {actual}")
         print(f"Match:            {actual == expected}")
@@ -196,4 +178,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
