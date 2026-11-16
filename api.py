@@ -1,10 +1,10 @@
 import hmac
 import os
-import re
 from typing import Any
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from typing_extensions import Annotated
@@ -22,12 +22,19 @@ class LedgerError(Exception):
 class BalanceRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     user_id: Annotated[str, StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
-    amount: int = Field(..., gt=0, le=1_000_000_000)
+    amount: int = Field(..., strict=True, gt=0, le=1_000_000_000)
 
 
 def _is_retryable_db_error(exc: Exception) -> bool:
     sqlstate = getattr(exc, "sqlstate", None)
     return sqlstate in {"40001", "40P01", "55P03"}
+
+
+def _invalid_request_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": "invalid_request", "message": "malformed JSON or invalid input"},
+    )
 
 
 def require_auth(request: Request) -> None:
@@ -55,6 +62,10 @@ def create_app() -> FastAPI:
     @app.exception_handler(LedgerError)
     async def ledger_error_handler(_request: Request, exc: LedgerError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"error": exc.code, "message": exc.message})
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(_request: Request, _exc: RequestValidationError) -> JSONResponse:
+        return _invalid_request_response()
 
     @app.middleware("http")
     async def ensure_auth(request: Request, call_next):

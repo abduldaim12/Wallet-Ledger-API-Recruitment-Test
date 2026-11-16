@@ -66,6 +66,10 @@ Success response:
 {"user_id":"u123","balance":21000}
 ```
 
+For credit and debit requests, `user_id` must be 1–64 characters using only letters,
+digits, `_`, or `-`. `amount` must be a JSON integer from 1 through 1,000,000,000;
+numeric strings, floats, and booleans are rejected. Unknown fields are ignored.
+
 ## Error contract
 
 Errors follow this shape:
