@@ -1,22 +1,41 @@
+
 # Wallet Ledger API
 
-A PostgreSQL-backed ledger service that exposes `credit`, `debit`, and `get_balance` on port `8080` behind a bearer token.
+A PostgreSQL-backed wallet ledger service providing atomic credit, debit, and balance operations through a REST API.
 
-## Quick start
+The service uses PostgreSQL as its persistent database, FastAPI for HTTP endpoints, Psycopg for database access, and Docker Compose for deployment.
+
+## 1. Quick Start
+
+Start the application and database:
 
 ```bash
 docker compose up --build
 ```
 
-The service listens on `http://localhost:8080` and expects the bearer token configured as the `API_TOKEN` environment variable in `docker-compose.yml`.
+The API listens at:
 
-Default token:
+```text
+http://localhost:8080
+```
+
+Interactive API documentation:
+
+```text
+http://localhost:8080/docs
+```
+
+All API endpoints require a bearer token configured through `API_TOKEN`.
+
+Default development token:
 
 ```text
 recruitment-test-token
 ```
 
-## API contract
+For production deployments, replace the default token with a securely generated secret.
+
+## 2. API Contract
 
 All endpoints require:
 
@@ -24,213 +43,459 @@ All endpoints require:
 Authorization: Bearer <token>
 ```
 
+Amounts are integer minor units. No floating-point currency calculations are used.
+
 ### Credit
+
+**Request**
 
 ```http
 POST /credit
 Content-Type: application/json
-
-{"user_id":"u123","amount":10000}
+Authorization: Bearer recruitment-test-token
 ```
-
-Success response:
 
 ```json
-{"user_id":"u123","balance":25000}
+{
+  "user_id": "u123",
+  "amount": 10000
+}
 ```
 
+**Success response — 200**
+
+```json
+{
+  "user_id": "u123",
+  "balance": 25000
+}
+```
+
+Credit creates the user balance record if it does not already exist.
+
 ### Debit
+
+**Request**
 
 ```http
 POST /debit
 Content-Type: application/json
-
-{"user_id":"u123","amount":4000}
+Authorization: Bearer recruitment-test-token
 ```
-
-Success response:
 
 ```json
-{"user_id":"u123","balance":21000}
+{
+  "user_id": "u123",
+  "amount": 4000
+}
 ```
 
-### Balance
+**Success response — 200**
+
+```json
+{
+  "user_id": "u123",
+  "balance": 21000
+}
+```
+
+A debit is rejected if the user does not exist or if the requested amount exceeds the available balance.
+
+### Get Balance
+
+**Request**
 
 ```http
 GET /balance/u123
+Authorization: Bearer recruitment-test-token
 ```
 
-Success response:
+**Success response — 200**
 
 ```json
-{"user_id":"u123","balance":21000}
+{
+  "user_id": "u123",
+  "balance": 21000
+}
 ```
 
-For credit and debit requests, `user_id` must be 1–64 characters using only letters,
-digits, `_`, or `-`. `amount` must be a JSON integer from 1 through 1,000,000,000;
-numeric strings, floats, and booleans are rejected. Unknown fields are ignored.
+### Input Validation
 
-## Error contract
+- `user_id` must contain between 1 and 64 characters.
+- Allowed characters: letters, digits, underscore (`_`), and hyphen (`-`).
+- `amount` must be a strict JSON integer.
+- Minimum amount: `1`.
+- Maximum amount: `1,000,000,000`.
+- Numeric strings, floating-point values, and booleans are rejected.
+- Unknown JSON fields are ignored.
 
-Errors follow this shape:
+## 3. Error Contract
+
+All errors use the following JSON structure:
 
 ```json
-{"error":"<code>","message":"<text>"}
+{
+  "error": "error_code",
+  "message": "Description of the error"
+}
 ```
 
-Status codes:
+| HTTP Status | Error Code | Description |
+|---|---|---|
+| 400 | `invalid_request` | Malformed JSON, missing fields, or invalid input |
+| 401 | `unauthorized` | Missing or invalid bearer token |
+| 404 | `user_not_found` | User does not exist |
+| 409 | `insufficient_funds` | Debit would reduce balance below zero |
 
-- `400` `invalid_request` — malformed JSON, missing field, or invalid input
-- `401` `unauthorized` — missing/wrong bearer token
-- `404` `user_not_found` — `debit` or `get_balance` for a never-funded user
-- `409` `insufficient_funds` — debit would reduce the balance below zero
+Authentication is checked before database operations.
 
-## Design decisions
+Token comparison uses constant-time comparison to avoid ordinary timing-based token comparison leaks.
 
-### Schema
+## 4. Database Design
 
-`ledger` stores the immutable transaction history. Every credit/debit inserts a single row with `user_id`, `entry_type`, `amount`, and `created_at`.
+The application uses PostgreSQL.
 
-`user_balances` is a per-user aggregate used for fast reads and row-level locking. It is updated in the same transaction as the ledger row so the cache and source-of-truth remain consistent.
+### Ledger Table
+
+The `ledger` table stores the transaction history.
+
+Each transaction records:
+
+- `id`: Unique ledger entry identifier.
+- `user_id`: Wallet owner.
+- `entry_type`: `credit` or `debit`.
+- `amount`: Positive integer amount.
+- `created_at`: Transaction timestamp.
+
+The ledger is the source of truth for wallet transactions.
+
+### User Balances Table
+
+The `user_balances` table maintains the current balance for each user.
+
+It provides:
+
+- Fast balance lookups.
+- Per-user row locking.
+- Efficient balance updates.
+- A primary-key index on `user_id`.
+
+The balance table is maintained transactionally alongside ledger entries.
 
 ### Indexes
 
-- `ledger(user_id, created_at DESC)`
-- `ledger(user_id, id)`
-- `user_balances(user_id)` as the primary key
+The schema includes:
 
-These are enough to support hot-user traffic and fast single-user reads without scanning the full ledger.
+```sql
+CREATE INDEX IF NOT EXISTS idx_ledger_user_created_at
+ON ledger(user_id, created_at DESC);
 
-### Concurrency safety
+CREATE INDEX IF NOT EXISTS idx_ledger_user_id
+ON ledger(user_id, id);
+```
 
-Each credit and debit performs a `SELECT ... FOR UPDATE` on the target user row inside a database transaction. That serializes writes per user while allowing independent users to proceed concurrently.
+The `user_balances.user_id` column is the primary key.
 
-The debit path checks `balance >= amount` before writing to the ledger, so concurrent debits cannot produce a negative balance or a lost update. The credit path uses the same transaction to both insert the ledger row and update the cache.
+These indexes support user-specific ledger queries and fast balance lookups.
 
-The API uses synchronous FastAPI route handlers for synchronous Psycopg operations, so database work runs in FastAPI's worker thread pool rather than blocking the event loop. A managed Psycopg connection pool is opened and closed with the application lifespan; its defaults are 5 minimum and 40 maximum connections, configurable with `DB_POOL_MIN_SIZE` and `DB_POOL_MAX_SIZE`.
+## 5. Transaction and Concurrency Safety
 
-Retry logic around serialization, deadlock, and lock-not-available SQL states uses a bounded exponential backoff before retrying the complete transaction.
+Credit and debit operations execute inside PostgreSQL transactions.
 
-### Seed strategy
+### Credit Workflow
 
-The seed routine builds at least 10M ledger rows across 100k+ users with a deliberately skewed distribution:
+1. Create the balance record if it does not exist.
+2. Lock the user's balance row using `SELECT ... FOR UPDATE`.
+3. Calculate the new balance.
+4. Insert the credit entry into the ledger.
+5. Update the user's balance.
+6. Commit both changes atomically.
 
-- first 100 users are hot users and receive roughly 100k rows each
-- remaining users receive 1 row each
+### Debit Workflow
 
-This creates realistic hot-user access patterns while keeping the seed practical on a laptop.
+1. Lock the user's balance row using `SELECT ... FOR UPDATE`.
+2. Verify that the user exists.
+3. Check that sufficient funds are available.
+4. Insert the debit entry into the ledger.
+5. Update the user's balance.
+6. Commit both changes atomically.
 
-The seed writes immutable ledger rows first and then recomputes the summary table from the ledger.
+If a transaction fails, its ledger and balance changes are rolled back together.
 
-### Seed timing
+### Concurrency Guarantees
 
-The seed runtime was not measured inside this sandbox environment. On a target laptop, run:
+Row-level locking serializes writes to the same user's wallet while allowing transactions for different users to proceed independently.
+
+This prevents:
+
+- Negative balances from concurrent debits.
+- Lost balance updates.
+- Ledger and balance inconsistencies caused by partial transactions.
+
+The implementation also retries selected PostgreSQL concurrency errors, including serialization failures, deadlocks, and lock-not-available errors, using bounded exponential backoff.
+
+### Connection Pooling
+
+The API uses synchronous FastAPI route handlers for synchronous Psycopg operations. FastAPI executes these handlers in its worker thread pool.
+
+A managed Psycopg connection pool is initialized and closed through the FastAPI application lifespan.
+
+Default configuration:
+
+| Setting | Default |
+|---|---:|
+| Minimum connections | 5 |
+| Maximum connections | 40 |
+| Autocommit | Disabled |
+
+Pool sizes can be configured through:
+
+```text
+DB_POOL_MIN_SIZE
+DB_POOL_MAX_SIZE
+```
+
+This allows database connections to be reused rather than establishing a new connection for every request.
+
+## 6. Database Seeding
+
+The seed process is designed to create at least 10 million ledger records across 100,000 or more users.
+
+The distribution is deliberately uneven:
+
+- The first 100 users receive approximately 100,000 records each.
+- Remaining users receive one record each.
+
+This creates hot-user workloads for concurrency and performance testing.
+
+The seed process:
+
+1. Generates ledger entries in batches.
+2. Inserts the ledger records.
+3. Recomputes the user balance table from the ledger.
+4. Commits the seeded data.
+
+The seed routine checks the existing ledger count before deciding whether additional seeding is required.
+
+### Running the Seed Command
 
 ```bash
 python main.py seed
 ```
 
-and record the duration in the output or timing shell log before submitting.
+**Seed timing:** The execution duration has not yet been measured and is intentionally not reported as a benchmark.
 
-## Query plans
+The seed routine should only be executed against an isolated test database when testing destructive reseeding behavior.
 
-These are the critical plans used by the service.
+## 7. Query Plans
 
-### Credit query
+The following plans were captured using PostgreSQL `EXPLAIN` against the seeded database.
 
-```sql
-EXPLAIN (ANALYZE, BUFFERS)
-WITH updated AS (
-  UPDATE user_balances
-  SET balance = balance + 1000
-  WHERE user_id = 'u123'
-  RETURNING balance
-)
-INSERT INTO ledger (user_id, entry_type, amount, created_at)
-VALUES ('u123', 'credit', 1000, NOW());
-```
+These are estimated execution plans, not `EXPLAIN ANALYZE` runtime measurements.
 
-Expected shape:
+### Credit Operation
+
+The credit API locks the user's balance, inserts a ledger entry, and updates the balance in one transaction.
+
+**Ledger insert plan:**
 
 ```text
-Update on user_balances
-  -> Index Scan using user_balances_pkey on user_balances
-       Index Cond: (user_id = 'u123'::text)
-Insert on ledger
-  -> Result
+Insert on ledger (cost=0.00..0.01 rows=0 width=0)
+  -> Result (cost=0.00..0.01 rows=1 width=88)
 ```
 
-### Debit query
-
-```sql
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT balance
-FROM user_balances
-WHERE user_id = 'u123'
-FOR UPDATE;
-```
-
-Expected shape:
+**Balance update plan:**
 
 ```text
-LockRows
+Update on user_balances (cost=0.29..8.31 rows=0 width=0)
   -> Index Scan using user_balances_pkey on user_balances
-       Index Cond: (user_id = 'u123'::text)
+       (cost=0.29..8.31 rows=1 width=14)
+       Index Cond: (user_id = 'u000000'::text)
 ```
 
-### Balance query
+### Debit Operation
 
-```sql
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT balance
-FROM user_balances
-WHERE user_id = 'u123';
+```text
+LockRows (cost=0.29..8.32 rows=1 width=14)
+  -> Index Scan using user_balances_pkey on user_balances
+       (cost=0.29..8.31 rows=1 width=14)
+       Index Cond: (user_id = 'u000000'::text)
 ```
 
-Expected shape:
+The primary-key index locates the user's balance row before PostgreSQL acquires the row lock.
+
+### Balance Operation
 
 ```text
 Index Scan using user_balances_pkey on user_balances
-  Index Cond: (user_id = 'u123'::text)
+  (cost=0.29..8.31 rows=1 width=8)
+  Index Cond: (user_id = 'u000000'::text)
 ```
 
-## Known limits and future work
+Balance reads use the primary-key index instead of scanning the full ledger.
 
-- The `user_balances` cache is derived from the ledger and is not the source of truth.
-- The design is optimized for a single primary database node.
-- If traffic grew by 10x, the first bottleneck is expected to be WAL pressure and insert throughput.
-- A multi-instance deployment would eventually need sharding or a write-through cache with distributed coordination.
+## 8. Load Test Results
 
-## Validation notes
+The following results were collected from the local Docker Compose environment using the seeded PostgreSQL database.
 
-The repository includes:
+### Test Command
 
-- PostgreSQL schema and indexes
-- a data seeding path that creates 10M+ ledger rows across 100k+ users
-- auth and concurrency tests in `tests/`
-- a basic load-test helper at `scripts/load_test.py`
+```bash
+python scripts/load_test.py --concurrency 100 --requests 1000
+```
 
-Run the current suite with:
+### Test Configuration
+
+| Parameter | Value |
+|---|---:|
+| Concurrent workers | 100 |
+| Requests per endpoint | 1,000 |
+| Endpoints tested | 3 |
+| Total benchmark requests | 3,000 |
+| Database | PostgreSQL |
+| Ledger size | More than 10 million records |
+
+### Measured Results
+
+| Metric | Result |
+|---|---:|
+| Total duration | 67.896 seconds |
+| Overall throughput | 44.19 requests/second |
+| Credit p50 | 1,611.298 ms |
+| Credit p99 | 10,071.670 ms |
+| Debit p50 | 1,485.783 ms |
+| Debit p99 | 9,868.125 ms |
+| Balance p50 | 1,184.466 ms |
+| Balance p99 | 9,443.756 ms |
+| Failed requests | 0 |
+
+### Final Balance Verification
+
+The benchmark used a single hot user.
+
+Initial funding was 1,000 units. The test executed 1,000 credits and 1,000 debits of one unit each.
+
+| Verification | Result |
+|---|---:|
+| Expected final balance | 1,000 |
+| Actual final balance | 1,000 |
+| Balance matched | Yes |
+
+All 3,000 benchmark requests returned HTTP 200.
+
+### Performance Observations
+
+The test deliberately sends concurrent writes to the same user, causing contention on that user's balance row.
+
+The results demonstrate successful request handling and correct final balance under this workload.
+
+However, tail latency is high. These measurements represent a single-hot-user stress test and should not be interpreted as general multi-user throughput.
+
+Further performance evaluation should include distributed users, different concurrency levels, and separate 1M versus 10M database comparisons.
+
+## 9. Automated Tests
+
+The repository includes tests for:
+
+- API input validation.
+- Authentication.
+- Invalid amount handling.
+- API error response contracts.
+- Concurrent debit safety.
+- Concurrent credit correctness.
+
+Run the test suite:
 
 ```bash
 python -m pytest -q
 ```
 
-The app should be started by:
+PostgreSQL integration tests require a configured PostgreSQL test database.
 
-```bash
-docker compose up --build
+**Important:** The concurrency integration tests truncate their test tables. Always configure them to use an isolated test database, never the seeded application database.
+
+Example Windows CMD configuration:
+
+```cmd
+set DB_HOST=localhost
+set DB_PORT=5432
+set DB_USER=wallet
+set DB_PASSWORD=walletpass
+set DB_NAME=wallet_test
+python -m pytest -q
 ```
 
-and then called on `http://localhost:8080` with the configured bearer token.
+## 10. Known Limitations and Future Improvements
 
-## Review call talking points
+- The balance table is a derived aggregate; the ledger remains the source of truth.
+- Seed execution time has not yet been measured.
+- The recorded load test focuses on one hot user and does not represent a distributed-user workload.
+- High p99 latency under hot-user contention requires further investigation.
+- The current architecture targets a single primary PostgreSQL database.
+- Larger deployments may require database tuning, workload distribution, and horizontal scaling strategies.
+- Database-level enforcement of ledger immutability should be independently verified before claiming protection against direct database modifications.
 
-A reviewer may ask:
+## 11. Docker Services
 
-- why the balance cache is safe despite being redundant
-- how the service avoids lost updates under concurrency
-- why the schema is optimized for single-user reads and hot-user access
-- what breaks first if the service is scaled horizontally
+Docker Compose runs:
 
-The short answer is that the ledger is the source of truth, the balance table is an indexable cache, and writes are serialized per user with `FOR UPDATE` while preserving atomic transaction boundaries.
+- PostgreSQL database service.
+- FastAPI application service.
+
+Start services:
+
+```bash
+docker compose up -d --build
+```
+
+Check service status:
+
+```bash
+docker compose ps
+```
+
+View application logs:
+
+```bash
+docker compose logs -f api
+```
+
+Open API documentation:
+
+```text
+http://localhost:8080/docs
+```
+
+## 12. Review Call Talking Points
+
+### Why maintain a separate balance table?
+
+The ledger provides the transaction history, while the balance table enables fast balance lookups without aggregating millions of ledger rows for every request.
+
+### How are concurrent debits handled?
+
+The application locks the user's balance row with `SELECT ... FOR UPDATE`, checks available funds, and commits the ledger entry and balance update in one transaction.
+
+### How are lost updates prevented?
+
+Concurrent transactions for the same user are serialized by PostgreSQL row-level locking.
+
+### How does the application handle database concurrency errors?
+
+Selected retryable PostgreSQL errors are retried with bounded exponential backoff.
+
+### What is the main performance limitation?
+
+A heavily accessed single wallet creates row-lock contention. The recorded benchmark shows high p99 latency under this workload.
+
+### What would be needed for horizontal scaling?
+
+A larger deployment would require careful database capacity planning, connection-pool tuning, and potentially partitioning or sharding strategies while preserving per-user transaction consistency.
+
+---
+
+## Summary
+
+The Wallet Ledger API provides PostgreSQL-backed credit, debit, and balance endpoints with bearer authentication, strict input validation, transactional ledger writes, row-level concurrency control, connection pooling, and a large-data seeding strategy.
+
+The implementation has been tested with automated tests and a 100-concurrent-worker hot-user load test. The benchmark confirms correct final balance and successful requests, while also identifying tail latency as an area for further optimization.
