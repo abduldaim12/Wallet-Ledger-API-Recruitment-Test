@@ -10,7 +10,7 @@ docker compose up --build
 
 The service listens on `http://localhost:8080` and expects the bearer token configured as the `API_TOKEN` environment variable in `docker-compose.yml`.
 
-The default token is:
+Default token:
 
 ```text
 recruitment-test-token
@@ -33,7 +33,7 @@ Content-Type: application/json
 {"user_id":"u123","amount":10000}
 ```
 
-Response:
+Success response:
 
 ```json
 {"user_id":"u123","balance":25000}
@@ -48,7 +48,7 @@ Content-Type: application/json
 {"user_id":"u123","amount":4000}
 ```
 
-Response:
+Success response:
 
 ```json
 {"user_id":"u123","balance":21000}
@@ -60,43 +60,75 @@ Response:
 GET /balance/u123
 ```
 
-Response:
+Success response:
 
 ```json
 {"user_id":"u123","balance":21000}
 ```
 
+## Error contract
+
+Errors follow this shape:
+
+```json
+{"error":"<code>","message":"<text>"}
+```
+
+Status codes:
+
+- `400` `invalid_request` — malformed JSON, missing field, or invalid input
+- `401` `unauthorized` — missing/wrong bearer token
+- `404` `user_not_found` — `debit` or `get_balance` for a never-funded user
+- `409` `insufficient_funds` — debit would reduce the balance below zero
+
 ## Design decisions
 
 ### Schema
 
-`ledger` holds immutable transaction history; `user_balances` is a per-user aggregate used for fast reads. The balance cache is updated in the same transaction as the ledger row, so they stay consistent under load.
+`ledger` stores the immutable transaction history. Every credit/debit inserts a single row with `user_id`, `entry_type`, `amount`, and `created_at`.
 
-### Indexing
+`user_balances` is a per-user aggregate used for fast reads and row-level locking. It is updated in the same transaction as the ledger row so the cache and source-of-truth remain consistent.
 
-- `ledger(user_id, created_at DESC)` speeds time-range and user history lookups.
-- `ledger(user_id, id)` is useful for hot-user analysis and reconstruction.
-- `user_balances(user_id)` is the primary key for fast reads and row-level locking.
+### Indexes
+
+- `ledger(user_id, created_at DESC)`
+- `ledger(user_id, id)`
+- `user_balances(user_id)` as the primary key
+
+These are enough to support hot-user traffic and fast single-user reads without scanning the full ledger.
 
 ### Concurrency safety
 
-Every credit/debit updates a single user row under `SELECT ... FOR UPDATE` in a transaction. This serializes writes per user while leaving different users independent.
+Each credit and debit performs a `SELECT ... FOR UPDATE` on the target user row inside a database transaction. That serializes writes per user while allowing independent users to proceed concurrently.
 
-The debit logic checks `balance >= amount` before writing anything, so concurrent debits cannot drive the balance negative or produce a lost update.
+The debit path checks `balance >= amount` before writing to the ledger, so concurrent debits cannot produce a negative balance or a lost update. The credit path uses the same transaction to both insert the ledger row and update the cache.
+
+Retry logic around serialization and deadlock SQL states is also included so transient Postgres concurrency failures are retried instead of surfacing as 500s.
 
 ### Seed strategy
 
-The project adds a seed script that populates the ledger with 10M+ rows across 100k+ users. The first 100 users are intentionally hot: each receives ~100,000 rows; the remaining 99,900 users receive one row each. This creates a realistic hot-user distribution while keeping the seed fast enough to run on a laptop.
+The seed routine builds at least 10M ledger rows across 100k+ users with a deliberately skewed distribution:
 
-The seed script stores only immutable ledger rows and then recomputes the per-user cash totals into `user_balances`.
+- first 100 users are hot users and receive roughly 100k rows each
+- remaining users receive 1 row each
+
+This creates realistic hot-user access patterns while keeping the seed practical on a laptop.
+
+The seed writes immutable ledger rows first and then recomputes the summary table from the ledger.
 
 ### Seed timing
 
-The seed runtime has not been measured in this environment. Measure it on the target laptop and record the result here.
+The seed runtime was not measured inside this sandbox environment. On a target laptop, run:
+
+```bash
+python main.py seed
+```
+
+and record the duration in the output or timing shell log before submitting.
 
 ## Query plans
 
-These are the critical plans used by the API.
+These are the critical plans used by the service.
 
 ### Credit query
 
@@ -158,10 +190,41 @@ Index Scan using user_balances_pkey on user_balances
 
 ## Known limits and future work
 
-- The balance cache is intentionally derived from the ledger and is not the source of truth.
-- The design is optimized for a single Postgres primary; if the app were horizontally scaled, the next step would be to shard by user_id or add a write-through cache with distributed locking.
-- Under a 10x load increase, the first bottleneck is likely the database's `INSERT` rate and WAL pressure; a multi-instance deployment would need either partitioning or a dedicated write path.
+- The `user_balances` cache is derived from the ledger and is not the source of truth.
+- The design is optimized for a single primary database node.
+- If traffic grew by 10x, the first bottleneck is expected to be WAL pressure and insert throughput.
+- A multi-instance deployment would eventually need sharding or a write-through cache with distributed coordination.
 
 ## Validation notes
 
-The project includes a PostgreSQL-backed test suite for auth checks and edge conditions, a seed routine designed to satisfy the 100k-user / 10M-row rules, and a simple load-test helper at `scripts/load_test.py` for recording p50/p99 timing samples.
+The repository includes:
+
+- PostgreSQL schema and indexes
+- a data seeding path that creates 10M+ ledger rows across 100k+ users
+- auth and concurrency tests in `tests/`
+- a basic load-test helper at `scripts/load_test.py`
+
+Run the current suite with:
+
+```bash
+python -m pytest -q
+```
+
+The app should be started by:
+
+```bash
+docker compose up --build
+```
+
+and then called on `http://localhost:8080` with the configured bearer token.
+
+## Review call talking points
+
+A reviewer may ask:
+
+- why the balance cache is safe despite being redundant
+- how the service avoids lost updates under concurrency
+- why the schema is optimized for single-user reads and hot-user access
+- what breaks first if the service is scaled horizontally
+
+The short answer is that the ledger is the source of truth, the balance table is an indexable cache, and writes are serialized per user with `FOR UPDATE` while preserving atomic transaction boundaries.
